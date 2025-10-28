@@ -1,0 +1,22 @@
+/* Minimal reset to remove Vite's default spacing/centering */
+* { box-sizing: border-box; }
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;                  /* remove default browser body margin */
+  background: #fff;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Kill Vite starter padding/centering so our app controls layout */
+#root {
+  margin: 0;
+  padding: 0;
+  max-width: none;
+  display: block;
+}
+
+/* Optional: normalize default heading/paragraph margins */
+h1, h2, h3, p { margin: 0; }
