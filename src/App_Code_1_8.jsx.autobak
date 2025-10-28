@@ -1,0 +1,1465 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
+
+
+/** Fallback ErrorBoundary (no-op). Replace with real boundary when available. */
+const ErrorBoundary = ({ children }) => <>{children}</>;
+
+
+// ===== Personas lockdown constants =====
+export const PERSONAS_UI_VERSION = 1;
+export const PERSONA_FIELD_ORDER = Object.freeze([
+  "bio",
+  "archetype",
+  "ethnicity",
+  "tone",
+  "affiliateMarketing"
+]);
+const STORAGE_KEY_PERSONAS = "personas";
+const STORAGE_META_PERSONAS = "personas_meta";
+const CURRENT_PERSONAS_SCHEMA = 3;
+const PERSONAS_UI_LOCKED = true; // keep true to freeze structure
+// ======================================
+
+
+/*
+  Persona Team Dashboard — FULL APP
+  - Tabs in order: dashboard, messages, personas, users, following, team, history, admin
+  - Personas: complete set of fields, Bio lock/modify+modal, Voice upload, Colors (Primary/Secondary),
+    && Favorites split into 8 subfields: Food, Movies, TV Shows, Music, Books, Types of Vacations, Games, Sports
+  - All data persisted in localStorage. Migrations preserve older saves.
+*/
+
+// ---------- Styles ----------
+const inputStyle = { width: "100%", boxSizing: "border-box", padding: "10px 12px", border: "1px solid #e5e7eb", borderRadius: 8, fontSize: 14, background: "#fff" };
+const smallText  = { fontSize: 12, color: "#6b7280" };
+const chipStyle  = { display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 8px", border: "1px solid #e5e7eb", borderRadius: 999, fontSize: 12, background: "#fff" };
+const primaryBtn = { padding: "8px 12px", borderRadius: 8, border: "1px solid #111", background: "#111", color: "#fff", fontWeight: 600, cursor: "pointer" };
+const subtleBtn  = { padding: "8px 12px", borderRadius: 8, border: "1px solid #e5e7eb", background: "#fff", color: "#111", cursor: "pointer" };
+const cardStyle  = { border: "1px solid #e5e7eb", borderRadius: 12, padding: 14, background: "#fafafa" };
+const emojiBtn  = { padding: "4px 6px", borderRadius: 6, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer", fontSize: 18, lineHeight: "20px" };
+const stickyHeader = { position: "sticky", top: 0, zIndex: 100, background: "#fff", padding: "10px 0", borderBottom: "1px solid #e5e7eb" };
+const linkBtn = { background:"none", border:"none", padding:0, color:"#2563eb", textDecoration:"underline", cursor:"pointer", fontSize:13 };
+
+// ---------- Helpers ----------
+function uid(){ return String(Date.now())+"-"+String(Math.floor(Math.random()*100000)); }
+function save(key, obj){ try{ localStorage.setItem(key, JSON.stringify(obj)); }catch(e){} }
+function load(key, fallback){ try{ const s=localStorage.getItem(key); return s?JSON.parse(s):fallback; }catch(e){ return fallback; } }
+function calcAge(iso){ if(!iso) return ""; const b=new Date(iso); if(isNaN(b)) return ""; const t=new Date(); let a=t.getFullYear()-b.getFullYear(); const m=t.getMonth()-b.getMonth(); if(m<0||(m===0&&t.getDate()<b.getDate())) a--; return String(a); }
+const CHANNEL_CHOICES=["X / Twitter","Instagram","TikTok","FanVue"];
+
+function asArray(v){
+  if (Array.isArray(v)) return v.filter(Boolean).map(s => String(s).trim()).filter(Boolean);
+  if (v == null) return [];
+  if (typeof v === 'string'){
+    return v.split(new RegExp("[,;|\\n]+")).map(s => s.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+// --- Reorder helper (used by drag & drop)
+function reorder(list, fromIndex, toIndex){
+  const arr=list.slice();
+  const [m]=arr.splice(fromIndex,1);
+  arr.splice(toIndex,0,m);
+  return arr;
+}
+const fieldStyle = (disabled=false)=> ({ ...inputStyle, ...(disabled?{ background:'#f3f4f6', color:'#6b7280', pointerEvents:'none' }:{} ) });
+function dateOnly(d=new Date()){ const y=d.getFullYear(); const m=String(d.getMonth()+1).padStart(2,'0'); const da=String(d.getDate()).padStart(2,'0'); return `${y}-${m}-${da}`; }
+function threadSubject(customer, dateStr=dateOnly()){ return `${customer||'unknown'} ${dateStr}`; }
+
+
+// ---- Personas schema helpers ----
+function coercePersona(p) {
+  const safe = { ...p };
+  if (!safe.bio || typeof safe.bio !== "object") safe.bio = { text: "", locked: false };
+  if (!safe.affiliateMarketing || typeof safe.affiliateMarketing !== "object")
+    safe.affiliateMarketing = { text: "", locked: false, savedAt: 0 };
+  if (!Array.isArray(safe.tone)) safe.tone = [];
+  return safe;
+}
+
+function loadPersonasMigrated() {
+  let raw = [];
+  try { raw = JSON.parse(localStorage.getItem(STORAGE_KEY_PERSONAS) || "[]"); } catch {}
+  const meta = (() => { try {return JSON.parse(localStorage.getItem(STORAGE_META_PERSONAS) || "{}");} catch {return {};} })();
+  let version = meta.schemaVersion ?? 0;
+  let personas = Array.isArray(raw) ? raw : [];
+
+  if (version < 3) {
+    personas = personas.map(p => ({
+      ...p,
+      affiliateMarketing:
+        typeof p.affiliateMarketing === "object" && p.affiliateMarketing
+          ? p.affiliateMarketing
+          : { text: "", locked: false, savedAt: 0 },
+    }));
+    version = 3;
+  }
+
+  personas = personas.map(coercePersona);
+  try {
+    localStorage.setItem(STORAGE_KEY_PERSONAS, JSON.stringify(personas));
+    localStorage.setItem(STORAGE_META_PERSONAS, JSON.stringify({ schemaVersion: version }));
+  } catch {}
+  return personas;
+}
+
+// Handy backup
+function exportPersonas() {
+  try {
+    const blob = new Blob([localStorage.getItem(STORAGE_KEY_PERSONAS) || "[]"], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `personas-backup-${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+  } catch {}
+}
+// ----------------------------------
+
+// Error boundary for Personas tab
+class TabBoundary extends React.Component {
+  constructor(props){ super(props); this.state = { err: null }; }
+  static getDerivedStateFromError(err){ return { err }; }
+  render(){
+    if (this.state.err) {
+      return React.createElement('div', {style:{padding:16,border:'1px solid #fca5a5',borderRadius:12,background:'#fff1f2'}}, 
+        'Personas crashed: ', String(this.state.err));
+    }
+    return this.props.children;
+  }
+}
+
+
+/** Persona Peek Modal (portal-rendered)
+ * Mirrors Personas card layout; Esc closes; background scroll is locked.
+ */
+function PersonaPeekModal({ persona, onClose, onOpenInTab }) {
+  if (!persona) return null;
+
+  const stop = (e) => e.stopPropagation();
+
+  // Simple initials helper
+  const initials = (name = "") => name.split(" ").filter(Boolean).map(s => s[0]).join("").slice(0,2).toUpperCase();
+
+  // Favorites grid keys
+  const favKeys = [
+    ["food","Food"],
+    ["movies","Movies"],
+    ["tvShows","TV Shows"],
+    ["music","Music"],
+    ["books","Books"],
+    ["vacations","Types of Vacations"],
+    ["games","Games"],
+    ["sports","Sports"]
+  ];
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      data-peek-version="v3"
+      onClick={onClose}
+      onKeyDown={(e)=>{
+        const k = e.key || e.code;
+        if (k === "Escape" || k === "Esc" || e.keyCode === 27) { e.stopPropagation(); onClose(); }
+      }}
+      tabIndex={0}
+      style={{
+        position:"fixed", inset:0, background:"rgba(0,0,0,0.5)",
+        display:"flex", alignItems:"center", justifyContent:"center",
+        zIndex: 9999, overscrollBehavior:"none"
+      }}
+    >
+      <div
+        onClick={stop}
+        style={{ background:"#fff", borderRadius:12, width:"min(980px, 92vw)", maxHeight:"85vh",
+                 overflow:"auto", boxShadow:"0 10px 30px rgba(0,0,0,0.2)" }}
+      >
+        {/* Header actions */}
+        <div style={{display:"flex", justifyContent:"flex-end", gap:8, padding:12, borderBottom:"1px solid #e5e7eb"}}>
+          <button
+            onClick={onOpenInTab}
+            style={{ padding:"8px 12px", borderRadius:8, border:"1px solid #e5e7eb", background:"#fff", cursor:"pointer" }}
+          >Open in Personas</button>
+          <button
+            onClick={onClose}
+            style={{ padding:"8px 12px", borderRadius:8, border:"1px solid #111", background:"#111", color:"#fff", fontWeight:600, cursor:"pointer" }}
+          >Close</button>
+        </div>
+
+        {/* Persona header (mirrors Personas card top) */}
+        <div style={{display:"grid", gridTemplateColumns:"88px 1fr", gap:16, padding:16, alignItems:"center"}}>
+          <div style={{width:72, height:72, borderRadius:12, background:"#f3f4f6", display:"grid", placeItems:"center", overflow:"hidden"}}>
+            {persona.thumbnail
+              ? <img src={persona.thumbnail} alt={persona.name} style={{width:"100%", height:"100%", objectFit:"cover"}}/>
+              : <div style={{fontWeight:700}}>{initials(persona.name)}</div>
+            }
+          </div>
+          <div>
+            <div style={{display:"flex", alignItems:"center", gap:12, flexWrap:"wrap"}}>
+              <h2 style={{margin:0, fontSize:20, fontWeight:700}}>{persona.name || "Unknown"}</h2>
+              <div style={{display:"inline-flex", alignItems:"center", gap:6}}>
+                <div title="Primary Color" style={{width:16, height:16, borderRadius:4, border:"1px solid #e5e7eb", background: persona.primaryColor || "#111"}}/>
+                <div title="Secondary Color" style={{width:16, height:16, borderRadius:4, border:"1px solid #e5e7eb", background: persona.secondaryColor || "#ff0055"}}/>
+              </div>
+            </div>
+            <div style={{marginTop:6, color:"#6b7280", fontSize:13}}>
+              {(persona.archetype ? `${persona.archetype} • ` : "") + (persona.ethnicity || "")}
+            </div>
+          </div>
+        </div>
+
+        {/* Quick facts row */}
+        <div style={{display:"grid", gridTemplateColumns:"repeat(3, 1fr)", gap:12, padding:"0 16px 16px"}}>
+          <div style={{border:"1px solid #e5e7eb", borderRadius:8, padding:10}}>
+            <div style={{fontSize:12, color:"#6b7280"}}>Birthday</div>
+            <div style={{fontSize:14}}>{persona.birthday || "—"}</div>
+          </div>
+          <div style={{border:"1px solid #e5e7eb", borderRadius:8, padding:10}}>
+            <div style={{fontSize:12, color:"#6b7280"}}>Age</div>
+            <div style={{fontSize:14}}>{(function(){
+              if (!persona.birthday) return "—";
+              const d = new Date(persona.birthday);
+              if (isNaN(d)) return "—";
+              const t = new Date();
+              let a = t.getFullYear()-d.getFullYear();
+              const m = t.getMonth()-d.getMonth();
+              if (m<0 || (m===0 && t.getDate()<d.getDate())) a--;
+              return String(a);
+            })()}</div>
+          </div>
+          <div style={{border:"1px solid #e5e7eb", borderRadius:8, padding:10}}>
+            <div style={{fontSize:12, color:"#6b7280"}}>Alias</div>
+            <div style={{fontSize:14}}>{persona.alias || "—"}</div>
+          </div>
+        </div>
+
+        {/* Bio + Affiliate Marketing */}
+        <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:16, padding:"0 16px 16px"}}>
+          <div style={{border:"1px solid #e5e7eb", borderRadius:8, padding:12}}>
+            <div style={{fontSize:12, color:"#6b7280", marginBottom:6}}>Bio</div>
+            <div style={{whiteSpace:"pre-wrap"}}>{(typeof persona.bio === "string" ? persona.bio : (persona.bio?.text || "")) || "—"}</div>
+          </div>
+          <div style={{border:"1px solid #e5e7eb", borderRadius:8, padding:12}}>
+            <div style={{fontSize:12, color:"#6b7280", marginBottom:6}}>Affiliate Marketing</div>
+            <div style={{whiteSpace:"pre-wrap"}}>{(persona.affiliateMarketing && typeof persona.affiliateMarketing === "object" ? persona.affiliateMarketing.text : "") || "—"}</div>
+          </div>
+        </div>
+
+        {/* Physical & style attributes */}
+        <div style={{display:"grid", gridTemplateColumns:"repeat(4, 1fr)", gap:12, padding:"0 16px 16px"}}>
+          {[
+            ["height","Height"],["weightRange","Weight Range"],["measurements","Measurements"],["cupSize","Cup Size"],
+            ["tone","Tone"],["style","Style"],["values","Values"],["boundaries","Boundaries"]
+          ].map(([key,label]) => (
+            <div key={key} style={{border:"1px solid #e5e7eb", borderRadius:8, padding:10}}>
+              <div style={{fontSize:12, color:"#6b7280"}}>{label}</div>
+              <div style={{fontSize:14, whiteSpace:"pre-wrap"}}>
+                {Array.isArray(persona[key]) ? (persona[key].length ? persona[key].join(", ") : "—") : (persona[key] || "—")}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Favorites grid (8-way) */}
+        <div style={{padding:"0 16px 16px"}}>
+          <div style={{fontSize:13, color:"#6b7280", marginBottom:8}}>Favorites</div>
+          <div style={{display:"grid", gridTemplateColumns:"repeat(4, 1fr)", gap:12}}>
+            {favKeys.map(([k,label]) => (
+              <div key={k} style={{border:"1px solid #e5e7eb", borderRadius:8, padding:10}}>
+                <div style={{fontSize:12, color:"#6b7280", marginBottom:6}}>{label}</div>
+                <div style={{fontSize:14}}>
+                  {persona.favorites && Array.isArray(persona.favorites[k]) && persona.favorites[k].length
+                    ? persona.favorites[k].join(", ")
+                    : "—"}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function App(){
+  const [tab,setTab]=useState("dashboard");
+  const topRef = useRef(null);
+  useEffect(() => { window.scrollTo(0, 0); topRef.current?.scrollIntoView({ block: "start" }); }, [tab]);
+
+  // ---------- Personas ----------
+  const defaultFavorites = { food:[], movies:[], tvShows:[], music:[], books:[], vacations:[], games:[], sports:[] };
+  const defaultPersonas=[
+    {id:uid(), name:"Nova Quinn", birthday:"", alias:"", bio:"", ethnicity:"", height:"", weightRange:"", measurements:"", cupSize:"",
+      primaryColor:"#111111", secondaryColor:"#ff0055",
+      affectionCues:[], signature:[], emojis:[], interests:[], favorites:{...defaultFavorites}, style:[], values:[], dosDonts:[], goals:[], fears:[], boundaries:[], tone:[],
+      thumbnail:"", voice:"", handles:[], bioSaved:false, bioSavedAt:0, affiliateMarketing:{ text:"", locked:false, savedAt:0 } },
+    {id:uid(), name:"Raven Rhynne", birthday:"", alias:"", bio:"", ethnicity:"", height:"", weightRange:"", measurements:"", cupSize:"",
+      primaryColor:"#111111", secondaryColor:"#ff0055",
+      affectionCues:[], signature:[], emojis:[], interests:[], favorites:{...defaultFavorites}, style:[], values:[], dosDonts:[], goals:[], fears:[], boundaries:[], tone:[],
+      thumbnail:"", voice:"", handles:[], bioSaved:false, bioSavedAt:0, affiliateMarketing:{ text:"", locked:false, savedAt:0 } },
+    {id:uid(), name:"Luna Voss", birthday:"", alias:"", bio:"", ethnicity:"", height:"", weightRange:"", measurements:"", cupSize:"",
+      primaryColor:"#111111", secondaryColor:"#ff0055",
+      affectionCues:[], signature:[], emojis:[], interests:[], favorites:{...defaultFavorites}, style:[], values:[], dosDonts:[], goals:[], fears:[], boundaries:[], tone:[],
+      thumbnail:"", voice:"", handles:[], bioSaved:false, bioSavedAt:0, affiliateMarketing:{ text:"", locked:false, savedAt:0 } }
+  ];
+  function migratePersonas(list){
+    return (list||[]).map(p=>{
+      // favorites migration
+      let fav;
+      const tmpl = { ...defaultFavorites };
+      if (Array.isArray(p.favorites)) {
+        fav = { ...tmpl, food: p.favorites.slice() };
+      } else if (p.favorites && typeof p.favorites === 'object') {
+        fav = { ...tmpl };
+        for (const k of Object.keys(tmpl)) fav[k] = Array.isArray(p.favorites[k]) ? p.favorites[k] : [];
+      } else {
+        fav = { ...tmpl };
+      }
+      return ({
+        ...p,
+        ethnicity:   p.ethnicity   ?? "",
+        height:      p.height      ?? "",
+        weightRange: p.weightRange ?? "",
+        measurements:p.measurements?? "",
+        cupSize:     p.cupSize     ?? "",
+        primaryColor: p.primaryColor ?? "#111111",
+        secondaryColor: p.secondaryColor ?? "#ff0055",
+        
+        archetype:   p.archetype   ?? "",
+        affiliateMarketing: (typeof p.affiliateMarketing === 'object' && p.affiliateMarketing) ? p.affiliateMarketing : { text: '', locked: false, savedAt: 0 },
+affectionCues: asArray(p.affectionCues),
+        signature: asArray(p.signature),
+        emojis: asArray(p.emojis),
+        interests: asArray(p.interests),
+        favorites: fav,
+        style: asArray(p.style),
+        values: asArray(p.values),
+        dosDonts: asArray(p.dosDonts),
+        goals: asArray(p.goals),
+        fears: asArray(p.fears),
+        boundaries: asArray(p.boundaries),
+        tone: asArray(p.tone),
+        handles: Array.isArray(p.handles)? p.handles : [],
+        bioSaved: !!p.bioSaved,
+        bioSavedAt: p.bioSavedAt || 0,
+      });
+    });
+  }
+  const [personas,setPersonas]=useState(migratePersonas(load("ptd_personas", defaultPersonas)));
+  useEffect(()=>{ save("ptd_personas", personas); },[personas]);
+
+  // One-time migration to fill missing keys
+  useEffect(()=>{
+    setPersonas(prev => prev.map(p => ({
+      ...p,
+      ethnicity:   p.ethnicity   ?? "",
+      height:      p.height      ?? "",
+      weightRange: p.weightRange ?? "",
+      measurements:p.measurements?? "",
+      cupSize:     p.cupSize     ?? "",
+      primaryColor: p.primaryColor ?? "#111111",
+      secondaryColor: p.secondaryColor ?? "#ff0055",
+      
+        archetype:   p.archetype   ?? "",
+        affiliateMarketing: (typeof p.affiliateMarketing === 'object' && p.affiliateMarketing) ? p.affiliateMarketing : { text: '', locked: false, savedAt: 0 },
+favorites: (()=>{
+        const tmpl={ food:[], movies:[], tvShows:[], music:[], books:[], vacations:[], games:[], sports:[] };
+        const f=p.favorites;
+        if (Array.isArray(f)) return { ...tmpl, food: f.slice() };
+        if (f && typeof f === 'object'){
+          const out={ ...tmpl };
+          for (const k of Object.keys(tmpl)) out[k]=Array.isArray(f[k])?f[k]:[];
+          return out;
+        }
+        return tmpl;
+      })(),
+      bioSaved: !!p.bioSaved,
+      bioSavedAt: p.bioSavedAt || 0,
+    })));
+  },[]);
+
+  function updatePersona(id, patch) { setPersonas(prev => prev.map(p => (p.id === id ? { ...p, ...patch } : p))); }
+  function lockBio(id){ setPersonas(prev => prev.map(p => p.id===id ? { ...p, bioSaved:true, bioSavedAt: Date.now() } : p)); }
+  function unlockBio(id){ setPersonas(prev => prev.map(p => p.id===id ? { ...p, bioSaved:false } : p)); }
+  function lockAffiliate(id){ setPersonas(prev => prev.map(p => p.id===id ? { ...p, affiliateMarketing: { ...(p.affiliateMarketing||{text:'',locked:false,savedAt:0}), locked:true, savedAt: Date.now() } } : p)); }
+  function unlockAffiliate(id){ setPersonas(prev => prev.map(p => p.id===id ? { ...p, affiliateMarketing: { ...(p.affiliateMarketing||{text:'',locked:false,savedAt:0}), locked:false } } : p)); }
+
+  const personaNames=useMemo(()=>personas.map(p=>p.name),[personas]);
+  const filePickers = useRef({});
+  const triggerFile = (i)=>{ const el=filePickers.current[i]; if(el) el.click(); };
+  const onFileChange=(i,e)=>{ const f=e.target.files?.[0]; if(!f) return; const r=new FileReader(); r.onload=()=>{ const c=[...personas]; c[i].thumbnail=r.result; setPersonas(c); }; r.readAsDataURL(f); e.target.value=""; };
+
+  const voicePickers = useRef({});
+  const triggerVoice = (i)=>{ const el=voicePickers.current[i]; if(el) el.click(); };
+  const onVoiceChange=(i,e)=>{ const f=e.target.files?.[0]; if(!f) return; const r=new FileReader(); r.onload=()=>{ const c=[...personas]; c[i].voice=r.result; setPersonas(c); }; r.readAsDataURL(f); e.target.value=""; };
+
+  const initials=(name="")=> name.split(" ").filter(Boolean).map(s=>s[0]).join("").slice(0,2).toUpperCase();
+  const [handleDraft, setHandleDraft] = useState({});
+
+  const [bioModalId, setBioModalId] = useState("");
+
+  // ---------- Drag & Drop (Personas & Team) ----------
+  const dragIndex = useRef(null);
+  const [dragType,setDragType] = useState("");
+  const [hoverIndex,setHoverIndex] = useState(-1);
+  function dragStart(type, idx){ setDragType(type); dragIndex.current=idx; }
+  function onDragOverCard(e){ e.preventDefault(); e.dataTransfer.dropEffect='move'; }
+  function onDropCard(type, idx){
+    const from=dragIndex.current; if(from===null) return;
+    if(type==='persona'){ setPersonas(prev=> reorder(prev, from, idx)); }
+    if(type==='team'){ setTeam(prev=> reorder(prev, from, idx)); }
+    dragIndex.current=null; setHoverIndex(-1); setDragType("");
+  }
+  function resetDrag(){ dragIndex.current=null; setHoverIndex(-1); setDragType(""); }
+
+  // ---------- Team ----------
+  const defaultTeam=[
+    {id:uid(), name:"Jarrett", role:"owner", personas:["Raven Rhynne","Nova Quinn"], lastSeen:Date.now()},
+    {id:uid(), name:"Alex", role:"QA", personas:["Nova Quinn"], lastSeen:0},
+    {id:uid(), name:"Ava", role:"member", personas:["Luna Voss"], lastSeen:0}
+  ];
+  const [team,setTeam]=useState(load("ptd_team", defaultTeam));
+  useEffect(()=>{ save("ptd_team", team); },[team]);
+  useEffect(()=>{ if(team.some(m=>m.role==='handler')){ setTeam(prev=> prev.map(m=> m.role==='handler'?{...m, role:'QA'}:m)); } },[]);
+  useEffect(()=>{ setTeam(prev => prev.some(m => m.name === 'You') ? prev.map(m => m.name === 'You' ? { ...m, name: 'Jarrett' } : m) : prev); },[]);
+  const ownerName = useMemo(()=> (team.find(t=>t.role==='owner')?.name) || team[0]?.name || 'Jarrett', [team]);
+  const you = useMemo(()=> team.find(t=> t.name === ownerName) || team[0], [team, ownerName]);
+  const allowedPersonas = useMemo(() => (you?.personas || []).slice(), [team, you]);
+  const assignedGlobal = useMemo(()=> new Set(team.flatMap(m=> m.personas || [])), [team]);
+
+  // ---------- History ----------
+  const [history,setHistory]=useState(load("ptd_history", []));
+  const [historySearch, setHistorySearch] = useState("");
+  useEffect(()=>{ save("ptd_history", history); },[history]);
+  const log=(type,extra={})=> setHistory(h=>[...h,{id:uid(), ts:Date.now(), type, ...extra}]);
+
+  // ---------- Messages / Inbox ----------
+  const [threads,setThreads]=useState(load("ptd_threads", []));
+  const [selected,setSelected]=useState(threads[0]?.id||"");
+  const [checked,setChecked]=useState({});
+
+  const [replyPersona,setReplyPersona]=useState(allowedPersonas[0]||"");
+  const [channel,setChannel]=useState(CHANNEL_CHOICES[0]);
+  const [customer,setCustomer]=useState("");
+    const [showPersonaPeek,setShowPersonaPeek]=useState(false);
+  
+  const [peekPersonaName,setPeekPersonaName]=useState("");
+  // __PEEK_PORTAL__ — render modal as a portal with scroll lock + Esc handling
+  const personaToPeek = useMemo(() => personas.find(pp => (pp.name||"") === (peekPersonaName||"")) || null, [personas, peekPersonaName]);
+  const peekTriggerEl = useRef(null);
+  useEffect(() => {
+    // track the last focused element that opened the modal (if a link/button calls openPersonaPeek, set peekTriggerEl.current there)
+    if (showPersonaPeek && !peekTriggerEl.current) {
+      try { peekTriggerEl.current = document.activeElement; } catch(_) {}
+    }
+  }, [showPersonaPeek]);
+
+  useEffect(() => {
+    if (!showPersonaPeek) return;
+    // Create root container
+    const host = document.createElement("div");
+    host.setAttribute("id", "persona-peek-root");
+    document.body.appendChild(host);
+    // Scroll lock (both html & body)
+    const html = document.documentElement;
+    const body = document.body;
+    const prevHtmlOverflow = html.style.overflow;
+    const prevBodyOverflow = body.style.overflow;
+    html.style.overflow = "hidden";
+    body.style.overflow = "hidden";
+
+    // Global Esc handlers (capture) && wheel/touch blockers for background
+    const onKey = (e) => {
+      const k = e.key || e.code;
+      if (k === "Escape" || k === "Esc" || e.keyCode === 27) {
+        e.preventDefault(); e.stopPropagation();
+        setShowPersonaPeek(false);
+      }
+    };
+    const blockScroll = (e) => {
+      // If event target is outside our modal card, block
+      const hostEl = host;
+      if (!hostEl) return;
+      const card = hostEl.querySelector("[role='dialog'] > div");
+      if (card && ! (card.contains(e.target))) {
+        e.preventDefault();
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    window.addEventListener("keyup", onKey, true);
+    window.addEventListener("wheel", blockScroll, { passive: false });
+    window.addEventListener("touchmove", blockScroll, { passive: false });
+
+    // Mount React root
+    const root = createRoot(host);
+    const handleClose = () => setShowPersonaPeek(false);
+    const handleOpenInTab = () => {
+      try { onCloseCleanup(); } catch(_) {}
+      openPersonaInTab();
+      setShowPersonaPeek(false);
+    };
+    root.render(
+      React.createElement(PersonaPeekModal, {
+        persona: personaToPeek,
+        onClose: handleClose,
+        onOpenInTab: handleOpenInTab
+      })
+    );
+
+    function onCloseCleanup(){
+      // Restore scroll + remove listeners
+      html.style.overflow = prevHtmlOverflow;
+      body.style.overflow = prevBodyOverflow;
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("keyup", onKey, true);
+      window.removeEventListener("wheel", blockScroll);
+      window.removeEventListener("touchmove", blockScroll);
+      try { root.unmount(); } catch(_) {}
+      try { host.remove(); } catch(_) {}
+      // Restore focus to trigger if possible
+      try { peekTriggerEl.current && typeof peekTriggerEl.current.focus === "function" && peekTriggerEl.current.focus(); } catch(_) {}
+      // Clear trigger ref for next time
+      peekTriggerEl.current = null;
+    }
+
+    // Cleanup when showPersonaPeek flips false || component unmounts
+    return () => { onCloseCleanup(); };
+  }, [showPersonaPeek, personaToPeek]);
+
+  function openPersonaPeek(name){ try{ /* remember trigger */ }catch(_){} setPeekPersonaName(name||""); setShowPersonaPeek(true); }
+  function openPersonaInTab(){
+    setTab("personas");
+    setTimeout(()=>{
+      const p = personas.find(pp=> (pp.name||"")===peekPersonaName);
+      const el = p ? document.getElementById(`persona-card-${p.id}`) : null;
+      if(el) el.scrollIntoView({behavior:"smooth", block:"center"});
+    }, 50);
+  }
+const [tagSel,setTagSel]=useState("First Contact");
+  const [tagDetail,setTagDetail]=useState("");
+  const [outreachDraft,setOutreachDraft]=useState("");
+  const [outreachPersona,setOutreachPersona]=useState(allowedPersonas[0]||"");
+  const [outreachChannel,setOutreachChannel]=useState(CHANNEL_CHOICES[0]);
+  const [outreachCustomer,setOutreachCustomer]=useState("");
+  const [showNew,setShowNew]=useState(false);
+  const [newPersona,setNewPersona]=useState(allowedPersonas[0]||"");
+  const [newChannel,setNewChannel]=useState(CHANNEL_CHOICES[0]);
+  const [newCustomer,setNewCustomer]=useState("");
+  const [firstMsg,setFirstMsg]=useState("");
+  const [replyDraft,setReplyDraft]=useState("")
+  const [composerSender,setComposerSender]=useState("persona");
+  const replyRef = useRef(null);
+  const [recentEmojis,setRecentEmojis]=useState(load("ptd_recent_emojis", ["😊","🥰","😘","😉","😂","✨","🔥","💖","😍","😏","🙈","💋"]));
+  useEffect(()=>{ save("ptd_recent_emojis", recentEmojis); },[recentEmojis]);
+
+// ---- Suggested Responses (state + helpers) ----
+const [suggestions, setSuggestions] = useState([]);
+const MAX_SUGGESTIONS = 5;
+
+function buildSuggestions(userText, personaName) {
+  const p = (personas || []).find(pp => (pp.name || "") === personaName) || {};
+  const cues = Array.isArray(p.affectionCues) ? p.affectionCues : [];
+  const tones = Array.isArray(p.tone) ? p.tone : [];
+  const favs  = (p.favorites && Array.isArray(p.favorites.food)) ? p.favorites.food : [];
+
+  const firstWord = (userText || "").trim().split(/\s+/)[0] || "there";
+  const softCue   = cues[0] ? `(${cues[0]}) ` : "";
+  const toneTag   = tones[0] ? `(${tones[0]}) ` : "";
+  const favLine   = favs[0] ? ` I’m craving ${favs[0]} lately…` : "";
+
+  const out = [
+    `${softCue}Hey ${firstWord}! That made me smile. Tell me more?`,
+    `${toneTag}I like that energy—how’s your day going so far?`,
+    `You’ve got me curious… what did you mean by “${(userText||"").slice(0,60)}”?`,
+    `Haha I feel that.${favLine} What are you in the mood for tonight?`,
+    `Wanna trade a secret for a secret? I’ll go first if you promise to share one too.`
+  ].filter(Boolean);
+
+  const uniq = Array.from(new Set(out)).slice(0, MAX_SUGGESTIONS);
+  return uniq.length ? uniq : [`Got it! Want to tell me a bit more?`];
+}
+
+// Keep the original call site happy; generate & set suggestions
+function triggerSuggestionsAfterUserSend(thread, userText) {
+  const personaName = (thread?.replyPersona || replyPersona || "");
+  const next = buildSuggestions(userText || "", personaName);
+  setSuggestions(next);
+}
+
+// Rehydrate suggestions when switching threads
+useEffect(() => {
+  const lastUser = curThread?.messages?.slice().reverse().find(m => m.direction === "in")?.text || "";
+  if (lastUser) {
+    try { triggerSuggestionsAfterUserSend(curThread, lastUser); } catch(_) {}
+  } else {
+    setSuggestions([]);
+  }
+}, [selected]);
+
+
+  const personaByName = useMemo(()=> Object.fromEntries(personas.map(p=>[p.name,p])), [personas]);
+  const chitChatPresets = useMemo(()=>{
+    const cues = personaByName[replyPersona]?.affectionCues || "";
+    return asArray(cues);
+  }, [personaByName, replyPersona]);
+  const subOptions = useMemo(()=>{
+    if(tagSel==="Chit Chat") return chitChatPresets;
+    return [];
+  }, [tagSel, chitChatPresets]);
+  useEffect(()=>{ setTagDetail(prev=> subOptions.includes(prev)? prev : ""); }, [subOptions]);
+
+  // --- History filters ---
+  const [hfType, setHfType] = useState("");
+  const [hfPersona, setHfPersona] = useState("");
+  const [hfChannel, setHfChannel] = useState("");
+  const [hfQ, setHfQ] = useState("");
+  const [hfWho, setHfWho] = useState("");
+  const [hfUser, setHfUser] = useState("");
+  const histTypes = useMemo(()=> Array.from(new Set(history.map(h=>h.type))), [history]);
+  const histPersonas = useMemo(()=> Array.from(new Set(history.map(h=>h.persona).filter(Boolean))), [history]);
+  const histChannels = useMemo(()=> Array.from(new Set(history.map(h=>h.channel).filter(Boolean))), [history]);
+  const histWhos = useMemo(() => team.map(t => t.name), [team]);
+  const histUsers = useMemo(()=> Array.from(new Set(history.map(h=>h.customer).filter(Boolean))), [history]);
+  useEffect(()=>{ if(!allowedPersonas.includes(replyPersona)) setReplyPersona(allowedPersonas[0]||""); },[allowedPersonas]);
+  useEffect(()=>{ if(!allowedPersonas.includes(outreachPersona)) setOutreachPersona(allowedPersonas[0]||""); },[allowedPersonas]);
+  useEffect(()=>{ if(!allowedPersonas.includes(newPersona)) setNewPersona(allowedPersonas[0]||""); },[allowedPersonas]);
+  useEffect(()=>{ save("ptd_threads", threads); },[threads]);
+  const [showThreadId, setShowThreadId] = useState("");
+  const tview = useMemo(()=> threads.find(t=> t.id===showThreadId) || null, [threads, showThreadId]);
+  const curThread=useMemo(()=> threads.find(t=>t.id===selected)||null,[threads,selected]);
+
+  function insertEmoji(emo){
+    const ta = replyRef.current;
+    if(ta){
+      const start = ta.selectionStart || 0; const end = ta.selectionEnd || 0;
+      const next = replyDraft.slice(0,start) + emo + replyDraft.slice(end);
+      setReplyDraft(next);
+      setTimeout(()=>{ try{ ta.focus(); const caret = start + emo.length; ta.setSelectionRange(caret, caret); }catch(_){} }, 0);
+    } else {
+      setReplyDraft((v)=> v + emo);
+    }
+    setRecentEmojis(prev=> [emo, ...prev.filter(e=>e!==emo)].slice(0,12));
+  }
+
+  function ensureThread(){
+    let t=threads.find(th=>th.id===selected)||null;
+    if(!t || t.customer!==customer || t.channel!==channel){
+      const id=uid();
+      t={ id, subject:threadSubject(customer, dateOnly()), replyPersona, channel, customer, assignee: ownerName, archived:false, messages:[], locked:false };
+      setThreads(prev=>[t,...prev]);
+      setSelected(id);
+      log("thread_new",{id, customer, channel, who: you?.name || ownerName, workflow:"Conversation", persona: replyPersona});
+    }
+    return t;
+  }
+  function addNewThread(){
+    setNewPersona(allowedPersonas.includes(outreachPersona)?outreachPersona:(allowedPersonas[0]||""));
+    setNewChannel(outreachChannel);
+    setNewCustomer(outreachCustomer||"");
+    setShowNew(true);
+  }
+  function createNewThread(){
+    if(!newCustomer.trim()) return;
+    const id=uid();
+    const t={ id, subject:threadSubject(newCustomer.trim(), dateOnly()), replyPersona:newPersona, channel:newChannel, customer:newCustomer.trim(), assignee: ownerName, archived:false, messages:[], locked:false };
+    setThreads(prev=>[t,...prev]);
+    setSelected(id);
+    setReplyPersona(newPersona);
+    setChannel(newChannel);
+    setCustomer(newCustomer.trim());
+    log("thread_manual",{id, who: you?.name || ownerName, workflow:"Conversation", persona:newPersona, channel:newChannel, customer:newCustomer.trim()});
+    setShowNew(false);
+  }
+  function archiveSelected(){
+    const ids=Object.keys(checked).filter(k=>checked[k]);
+    if(!ids.length) return;
+    setThreads(prev=> prev.map(t=> ids.includes(t.id)?{...t, archived:true}:t));
+    setChecked({});
+    if(ids.includes(selected)) setSelected("");
+    log("threads_archived",{count:ids.length, who: you?.name || ownerName, workflow:"Inbox", selection:Object.keys(checked).filter(k=>checked[k])});
+  }
+  function startOutreach(){
+    if(!outreachDraft.trim()){ alert("Enter a prospecting message first."); return; }
+    const id=uid();
+    const t={ id,
+      subject:threadSubject(outreachCustomer, dateOnly()),
+      replyPersona: outreachPersona,
+      channel: outreachChannel,
+      customer: outreachCustomer,
+      assignee: ownerName,
+      archived:true,
+      messages:[{ id:uid(), ts:Date.now(), from:outreachPersona, direction:"out", text:outreachDraft.trim() }],
+      locked:true };
+    setThreads(prev=>[t,...prev]);
+    setOutreachDraft("");
+    log("prospect_started",{id, who: you?.name || ownerName, workflow:"Prospecting Outreach", persona: outreachPersona, channel: outreachChannel, customer: outreachCustomer, text: outreachDraft.trim()});
+  }
+  function addFirst(){
+    if(!firstMsg.trim()) return; const t=curThread || ensureThread();
+    t.messages.push({ id:uid(), ts:Date.now(), from:customer, direction:"in", text:firstMsg.trim() });
+    t.locked = true;
+    setThreads(prev=> prev.map(tt=> tt.id===t.id?{...t}:tt)); setFirstMsg(""); log("message_in",{thread:t.id, who: you?.name || ownerName, workflow:"Conversation", persona: t.replyPersona, channel: t.channel, customer: t.customer, text: firstMsg.trim(), category: tagSel, sub: tagDetail});
+  }
+  function sendReply(){
+    if(composerSender==="user"){
+      const t = curThread || ensureThread();
+      t.messages.push({ id:uid(), ts:Date.now(), from:customer, direction:"in", text:replyDraft.trim() });
+      t.locked = true;
+      setThreads(prev=> prev.map(x=> x.id===t.id ? {...t} : x));
+      setReplyDraft("");
+      setTimeout(()=>{ replyRef.current?.focus(); }, 0);
+      try { triggerSuggestionsAfterUserSend(t, replyDraft.trim()); } catch(e){}
+      return;
+    }
+
+    if(!replyDraft.trim()) return;
+    const t = curThread || ensureThread();
+    const personaToUse = t.locked ? t.replyPersona : replyPersona;
+    if(!allowedPersonas.includes(personaToUse)){ alert("You are ! assigned this persona on the Team tab."); return; }
+    if(!t.locked){ t.replyPersona = replyPersona; t.channel = channel; t.customer = customer; }
+    t.messages.push({ id:uid(), ts:Date.now(), from:personaToUse, direction:"out", text:replyDraft.trim() });
+    setThreads(prev=> prev.map(tt=> tt.id===t.id?{...t}:tt)); setReplyDraft(""); log("message_out",{thread:t.id, who: you?.name || ownerName, workflow:"Conversation", persona: personaToUse, channel: t.channel, customer: t.customer, text: replyDraft.trim(), category: tagSel, sub: tagDetail});
+  }
+
+  // ---- NEW: Add button to create a fresh conversation & unlock inputs ----
+  function addConversationAndUnlock(){
+    // Create a new, unlocked thread && select it.
+    const id = uid();
+    const rp = allowedPersonas.includes(replyPersona) ? replyPersona : (allowedPersonas[0] || "");
+    const t = {
+      id,
+      subject: threadSubject(customer || "", dateOnly()),
+      replyPersona: rp,
+      channel,
+      customer: customer || "",
+      assignee: ownerName,
+      archived: false,
+      messages: [],
+      locked: false
+    };
+    setThreads(prev => [t, ...prev]);
+    setSelected(id);
+    // clear the draft so it feels "new"
+    setReplyDraft("");
+    log("thread_add_button", { id, who: you?.name || ownerName, workflow: "Conversation", persona: rp, channel, customer: customer || "" });
+  }
+
+  function ChipField({label, items=[], onChange, placeholder}){
+    const [draft,setDraft]=useState("");
+    const add=(val)=>{ const v=(val??draft).trim(); if(!v) return; const next=Array.from(new Set([...(items||[]), v])); onChange(next); setDraft(""); };
+    const onKey=(e)=>{ if(e.key==='Enter' || e.key===',' || e.key===';'){ e.preventDefault(); add(); } };
+    return (
+      <div>
+        {label ? <label style={smallText}>{label}</label> : null}
+        <div style={{ display:'flex', gap:8, flexWrap:'wrap' }}>
+          {(items||[]).map((t,ti)=>(
+            <span key={t+ti} style={chipStyle}>{t}
+              <button onClick={()=>{ const next=[...(items||[])]; next.splice(ti,1); onChange(next); }} style={{ background:'none', border:'none', color:'#ef4444', marginLeft:6 }}>x</button>
+            </span>
+          ))}
+        </div>
+        <div style={{ display:'flex', gap:8, marginTop:6 }}>
+          <input style={inputStyle} value={draft} onChange={e=>setDraft(e.target.value)} onKeyDown={onKey} placeholder={placeholder||'Add value…'} />
+          <button style={subtleBtn} onClick={()=>add()}>Add</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div ref={topRef} style={{ padding:20, maxWidth:1220, margin:"0 auto" }}>
+      <div style={stickyHeader}>
+        <h2 style={{ margin: 0 }}>AI Persona Team Dashboard</h2>
+        <nav style={{ display:"flex", gap:8, marginTop:8 }}>
+          {["dashboard","messages","personas","users","following","team","history","admin"].map(tn => (
+            <button key={tn} onClick={() => setTab(tn)} style={tab === tn ? primaryBtn : subtleBtn}>{tn}</button>
+          ))}
+        </nav>
+      </div>
+
+      {/* ------------ DASHBOARD ------------- */}
+      {tab==="dashboard" && (<div style={cardStyle}>Welcome! Use the tabs to manage personas, team, && conversations.</div>)}
+
+      {/* ------------ MESSAGES ------------- */}
+      {tab==="messages" && (
+        <div style={{ display:"grid", gridTemplateColumns:"280px 1fr", gap:16, height:"calc(100vh - 140px)" }}>
+          {/* Inbox */}
+          <div style={{ display:"flex", flexDirection:"column", minHeight:0, height:"100%" }}>
+            <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+              <h3>Inbox</h3>
+              <div style={{ display:"flex", gap:6 }}>
+                <button style={{ ...subtleBtn, opacity:Object.values(checked).some(Boolean)?1:0.5 }} disabled={!Object.values(checked).some(Boolean)} onClick={archiveSelected}>Archive</button>
+              </div>
+            </div>
+            <div style={{ flex:1, overflowY:"auto" }}>
+            {threads.filter(t=>!t.archived).map(th=>(
+              <div key={th.id} onClick={()=>{ setSelected(th.id); setReplyPersona(th.replyPersona); setChannel(th.channel); setCustomer(th.customer); }} style={{ cursor:"pointer", padding:8, border:"1px solid #e5e7eb", borderRadius:8, marginBottom:8, background: th.id===selected?"#eef2ff":"#fff", display:"flex", alignItems:"center", gap:8 }}>
+                <input type="checkbox" checked={!!checked[th.id]} onChange={e=> setChecked({ ...checked, [th.id]: e.target.checked })} />
+                <div>
+                  <div style={{ fontWeight:600 }}>{th.subject}</div>
+                  <div style={smallText}>{th.channel} • {th.replyPersona}</div>
+                </div>
+              </div>
+            ))}
+            </div>
+          </div>
+
+          {/* Composer + Thread */}
+          <div style={{ display:"flex", flexDirection:"column", minHeight:0, height:"100%" }}>
+            {/* Prospecting */}
+            <h3>Prospecting Outreach</h3>
+            <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+              <select value={outreachPersona} onChange={e=>setOutreachPersona(e.target.value)} style={{ ...inputStyle, maxWidth:220 }}>
+                {allowedPersonas.map(n=> <option key={n} value={n}>{n}</option>)}
+              </select>
+              <select value={outreachChannel} onChange={e=>setOutreachChannel(e.target.value)} style={{ ...inputStyle, maxWidth:180 }}>
+                {CHANNEL_CHOICES.map(c=> <option key={c}>{c}</option>)}
+              </select>
+              <input value={outreachCustomer} onChange={e=>setOutreachCustomer(e.target.value)} style={{ ...inputStyle, maxWidth:220 }} placeholder="Enter username here" />
+            </div>
+            <div style={{ display:"flex", gap:8, alignItems:"flex-start", marginBottom:12 }}>
+              <textarea style={{ ...inputStyle }} rows={2} value={outreachDraft} onChange={e=>setOutreachDraft(e.target.value)} placeholder="Prospect message (auto-archived)" />
+              <button style={primaryBtn} onClick={startOutreach}>Send</button>
+            </div>
+
+            {/* Conversation */}
+            <h3 style={{ display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+              <span>Conversation</span>
+              {/* Align with Send buttons on the right */}
+              <button style={primaryBtn} onClick={addNewThread}>Add</button>
+            </h3>
+            {showNew && (
+              <div style={{ margin:"8px 0 12px", padding:10, border:"1px solid #e5e7eb", borderRadius:6, background:"#fff" }}>
+                <div style={{ display:"flex", gap:10, alignItems:"center", flexWrap:"wrap" }}>
+                  <select value={newPersona} onChange={e=>setNewPersona(e.target.value)} style={{ ...inputStyle, minWidth:160 }}>
+                    {allowedPersonas.map(p=><option key={p} value={p}>{p}</option>)}
+                  </select>
+                  <select value={newChannel} onChange={e=>setNewChannel(e.target.value)} style={{ ...inputStyle, minWidth:140 }}>
+                    {CHANNEL_CHOICES.map(c=><option key={c} value={c}>{c}</option>)}
+                  </select>
+                  <input value={newCustomer} onChange={e=>setNewCustomer(e.target.value)} placeholder="Enter username here" style={{ ...inputStyle, minWidth:220 }} />
+                  <button style={primaryBtn} onClick={createNewThread}>Create</button>
+                  <button style={subtleBtn} onClick={()=>setShowNew(false)}>Cancel</button>
+                </div>
+              </div>
+            )}
+
+            {curThread?.locked && (
+  <div style={{...smallText, marginBottom:8}}>
+    <button onClick={()=>openPersonaPeek(replyPersona)} style={{ background:"none", border:"none", padding:0, margin:0, color:"#1d4ed8", cursor:"pointer", textDecoration:"underline" }}>{replyPersona}</button>
+    {" "}• {" "}{curThread.customer} {" "}• {" "}{curThread.channel}
+  </div>
+)}
+            <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+              <select value={replyPersona} onChange={e=>!curThread?.locked && setReplyPersona(e.target.value)} disabled={!!curThread?.locked} style={{ ...fieldStyle(!!curThread?.locked), maxWidth:220 }}>
+                {allowedPersonas.map(n=> <option key={n} value={n}>{n}</option>)}
+              </select>
+              <select value={channel} onChange={e=>!curThread?.locked && setChannel(e.target.value)} disabled={!!curThread?.locked} style={{ ...fieldStyle(!!curThread?.locked), maxWidth:180 }}>
+                {CHANNEL_CHOICES.map(c=> <option key={c}>{c}</option>)}
+              </select>
+              <input value={customer} onChange={e=>!curThread?.locked && setCustomer(e.target.value)} disabled={!!curThread?.locked} style={{ ...fieldStyle(!!curThread?.locked), maxWidth:220 }} placeholder="Enter username here" />
+            </div>
+            <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+              <select value={tagSel} onChange={e=> setTagSel(e.target.value)} style={{ ...inputStyle, maxWidth:220 }}>
+                {["First Contact","Chit Chat","Sexy Time","Requests","Ending the Conversation"].map(o=> <option key={o} value={o}>{o}</option>)}
+              </select>
+              <select value={tagDetail} onChange={e=> setTagDetail(e.target.value)} style={{ ...inputStyle, maxWidth:260 }} disabled={!(tagSel==='Chit Chat' || tagSel==='Sexy Time' || tagSel==='Requests') || subOptions.length===0}>
+                <option value="">{subOptions.length? "Select preset…" : "No presets (persona tab)"}</option>
+                {subOptions.map(s=> <option key={s} value={s}>{s}</option>)}
+              </select>
+            </div>
+
+            {/* Thread messages */}
+            <div style={{ border:"1px solid #e5e7eb", borderRadius:8, padding:10, background:"#fff", minHeight:180, flex:1, overflowY:"auto", marginBottom:8 }}>
+              {curThread?.messages && curThread.messages.length>0 ? (
+                curThread.messages
+                  .slice()
+                  .sort((a,b)=>a.ts-b.ts)
+                  .map(m => (
+                    <div key={m.id} style={{ marginBottom:8 }}>
+                      <div><strong>{m.from}:</strong> {m.text}</div>
+                      <div style={{ ...smallText }}>{new Date(m.ts).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</div>
+                    </div>
+                  ))
+              ) : (
+                <div style={{ color:"#9ca3af" }}>No messages yet.</div>
+              )}
+            </div>
+
+            {/* Composer */}
+            <div style={{ display:"flex", alignItems:"center", gap:10, marginTop:6, marginBottom:4 }}>
+              <span style={{ fontSize:12, color:"#6b7280" }}>Sender:</span>
+              <label style={{ display:"flex", alignItems:"center", gap:6 }}>
+                <input type="radio" checked={composerSender==="persona"} onChange={()=>setComposerSender("persona")} />
+                <span>Persona</span>
+              </label>
+              <label style={{ display:"flex", alignItems:"center", gap:6 }}>
+                <input type="radio" checked={composerSender==="user"} onChange={()=>setComposerSender("user")} />
+                <span>User</span>
+              </label>
+            </div>
+            <div style={{ display:"flex", gap:8, alignItems:"stretch" }}>
+              <textarea
+                ref={replyRef}
+                style={{ ...inputStyle }}
+                rows={2}
+                value={replyDraft}
+                onChange={e=>setReplyDraft(e.target.value)}
+                onKeyDown={e=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); sendReply(); } }}
+                placeholder="Persona reply... (Enter to send, Shift+Enter for newline)"
+              />
+              <button style={{ ...primaryBtn, alignSelf:"stretch" }} onClick={sendReply}>Send</button>
+            </div>
+            <div style={{ marginTop:6 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:6, flexWrap:"wrap" }}>
+                {recentEmojis.map(e=>(
+                  <button key={"r"+e} style={emojiBtn} onClick={()=>insertEmoji(e)} title="Recent">{e}</button>
+                ))}
+                <span style={smallText}>•</span>
+                {["😊","🥰","😘","😉","😂","✨"].filter(e=>!recentEmojis.includes(e)).map(e=>(
+                  <button key={"q"+e} style={emojiBtn} onClick={()=>insertEmoji(e)}>{e}</button>
+                ))}
+              </div>
+            </div>
+
+{/* Suggested Responses */}
+<div style={{ ...cardStyle, marginTop: 10 }}>
+  <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
+    <strong>Suggested Responses</strong>
+    <div style={smallText}>
+      {suggestions.length ? `Auto-generated from last user message` : `Waiting for a user message…`}
+    </div>
+  </div>
+  <div style={{ display:'grid', gridTemplateColumns:'repeat(2, minmax(0, 1fr))', gap:8 }}>
+    {(suggestions.length ? suggestions : [
+      "— Suggestions will appear here after the next user message —",
+      "Tip: Ask an open-ended question to get better prompts."
+    ]).map((s, i) => (
+      <button
+        key={i}
+        style={{ ...subtleBtn, textAlign:'left', whiteSpace:'normal', lineHeight:'1.3', padding:'10px 12px' }}
+        onClick={() => setReplyDraft(prev => (prev ? (prev.endsWith(' ') ? prev + s : prev + ' ' + s) : s))}
+        disabled={!suggestions.length}
+        title={suggestions.length ? "Insert into message" : "No suggestions yet"}
+      >
+        {s}
+      </button>
+    ))}
+  </div>
+  {suggestions.length > 0 && (
+    <div style={{ marginTop:10, display:'flex', gap:8, justifyContent:'flex-end' }}>
+      <button style={subtleBtn} onClick={() => setSuggestions([])}>Clear</button>
+      <button
+        style={primaryBtn}
+        onClick={() => {
+          const t = curThread || null;
+          const lastUser = t?.messages?.slice().reverse().find(m => m.direction === "in")?.text || "";
+          triggerSuggestionsAfterUserSend(t, lastUser);
+        }}
+      >
+        Regenerate
+      </button>
+    </div>
+  )}
+</div>
+
+          </div>
+        </div>
+      )}
+
+      
+      
+      
+      
+      {/* Persona Modal (full widget, read-only, mirrors Personas tab) */}
+      {showPersonaPeek && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:2000 }} onClick={()=>setShowPersonaPeek(false)}>
+          <div style={{ background:"#fff", borderRadius:14, padding:16, width:980, maxHeight:"86vh", overflow:"auto", boxShadow:"0 10px 30px rgba(0,0,0,0.25)" }} onClick={e=>e.stopPropagation()}>
+            {(() => { const p = personas.find(pp => (pp.name||"")===peekPersonaName) || null; if(!p) return (<div style={{color:"#6b7280"}}>Persona ! found.</div>);
+              const ReadOnly = ({label, value}) => (
+                <div>
+                  <label style={smallText}>{label}</label>
+                  <input style={{ ...inputStyle, background:"#f9fafb", color:"#6b7280" }} readOnly value={value||""} />
+                </div>
+              );
+              return (
+              <div>
+                {/* Header (same layout) */}
+                <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                    {p.thumbnail ? (
+                      <img src={p.thumbnail} alt={p.name} style={{ width:72, height:72, borderRadius:12, objectFit:"cover", border:"1px solid #e5e7eb" }} />
+                    ) : (
+                      <div style={{ width:72, height:72, borderRadius:12, background:"#e5e7eb", display:"flex", alignItems:"center", justifyContent:"center", color:"#374151", fontWeight:700 }}>{(p.name||"").split(" ").map(s=>s[0]).join("").slice(0,2).toUpperCase()}</div>
+                    )}
+                    <div>
+                      <div style={{ fontSize:18, fontWeight:700 }}>{p.name}</div>
+                      <div style={{ fontSize:12, color:"#6b7280" }}>{p.archetype || ""}</div>
+                    </div>
+                  </div>
+                  <button onClick={()=>setShowPersonaPeek(false)} style={{ border:"none", background:"#000", color:"#fff", borderRadius:10, padding:"6px 10px", cursor:"pointer" }}>Close</button>
+                </div>
+
+                {/* Birth/Age */}
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:8 }}>
+                  <ReadOnly label="Birthday" value={p.birthday} />
+                  <ReadOnly label="Age" value={calcAge(p.birthday)||""} />
+                </div>
+
+                {/* Username handles (chips) */}
+                {Array.isArray(p.handles) && p.handles.length>0 && (
+                  <div style={{ marginBottom:12 }}>
+                    <div style={{ fontSize:12, color:"#6b7280", marginBottom:6 }}>Usernames</div>
+                    <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                      {p.handles.map((h,hi)=> (
+                        <span key={h.platform+hi} style={{ display:"inline-flex", gap:6, alignItems:"center", background:"#f3f4f6", border:"1px solid #e5e7eb", borderRadius:999, padding:"4px 10px", fontSize:12 }}>
+                          {h.platform}: <strong style={{ marginLeft:4 }}>{h.username}</strong>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Bio */}
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginTop:8 }}>
+                  <ReadOnly label="Ethnicity" value={p.ethnicity} />
+                  <ReadOnly label="Height" value={p.height} />
+                  <ReadOnly label="Weight Range" value={p.weightRange} />
+                  <ReadOnly label="Measurements" value={p.measurements} />
+                  <ReadOnly label="Cup Size" value={p.cupSize} />
+                </div>
+
+                {/* Physicals */}
+                <div style={{ marginBottom:10 }}>
+                  <div style={{ fontSize:12, color:"#6b7280", marginBottom:4 }}>Bio</div>
+                  <div style={{ background:"#f9fafb", border:"1px solid #e5e7eb", borderRadius:10, padding:10, minHeight:40, whiteSpace:"pre-wrap" }}>{(p.bio && p.bio.text) || p.bio || ""}</div>
+                </div>
+
+                {/* Affection / Signature / Emojis / Interests */}
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginTop:12 }}>
+                  <ChipField readOnly label="Affection Cues" items={p.affectionCues||[]} />
+                  <ChipField readOnly label="Signature Phrases" items={p.signature||[]} />
+                  <ChipField readOnly label="Emojis" items={p.emojis||[]} />
+                  <ChipField readOnly label="Interests" items={p.interests||[]} />
+                </div>
+
+                {/* Favorites */}
+                <div style={{ border:"1px dashed #e5e7eb", borderRadius:10, padding:10, background:"#fff", marginTop:12 }}>
+                  <strong>Favorites</strong>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginTop:8 }}>
+                    <ChipField readOnly label="Food" items={p.favorites?.food||[]} />
+                    <ChipField readOnly label="Movies" items={p.favorites?.movies||[]} />
+                    <ChipField readOnly label="TV Shows" items={p.favorites?.tvShows||[]} />
+                    <ChipField readOnly label="Music" items={p.favorites?.music||[]} />
+                    <ChipField readOnly label="Books" items={p.favorites?.books||[]} />
+                    <ChipField readOnly label="Types of Vacations" items={p.favorites?.vacations||[]} />
+                    <ChipField readOnly label="Games" items={p.favorites?.games||[]} />
+                    <ChipField readOnly label="Sports" items={p.favorites?.sports||[]} />
+                  </div>
+                </div>
+
+                {/* Colors */}
+                <div style={{ border:"1px dashed #e5e7eb", borderRadius:10, padding:10, background:"#fff", marginTop:12 }}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                    <strong>Colors</strong>
+                    <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                      <span style={{ width:16, height:16, borderRadius:4, border:"1px solid #e5e7eb", backgroundColor:p.primaryColor||"#fff" }} />
+                      <span style={{ width:16, height:16, borderRadius:4, border:"1px solid #e5e7eb", backgroundColor:p.secondaryColor||"#fff" }} />
+                    </div>
+                  </div>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginTop:8 }}>
+                    <ReadOnly label="Primary" value={p.primaryColor} />
+                    <ReadOnly label="Secondary" value={p.secondaryColor} />
+                  </div>
+                </div>
+
+                {/* Values, Guidelines, Goals, Fears, Boundaries, Tone */}
+                <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginTop:12 }}>
+                  <ChipField readOnly label="Style" items={p.style||[]} />
+                  <ChipField readOnly label="Values" items={p.values||[]} />
+                  <ChipField readOnly label="Do's & Don'ts" items={p.dosDonts||[]} />
+                  <ChipField readOnly label="Goals" items={p.goals||[]} />
+                  <ChipField readOnly label="Fears" items={p.fears||[]} />
+                  <ChipField readOnly label="Boundaries" items={p.boundaries||[]} />
+                  <ChipField readOnly label="Tone" items={p.tone||[]} />
+                </div>
+
+              </div>
+            ); })()}
+          </div>
+        </div>
+      )}
+{/* ------------ PERSONAS ------------- */}
+      {tab==='personas' && (<TabBoundary>
+        <div style={{ display:"grid", gap:16, gridTemplateColumns:"repeat(auto-fill, minmax(380px, 1fr))" }}>
+          {personas.map((p,i)=>(
+            <div key={p.id} id={`persona-card-${p.id}`} style={{ ...cardStyle, outline: (hoverIndex===i && dragType==='persona') ? "2px dashed #3b82f6" : "none" }} draggable onDragStart={()=>dragStart('persona', i)} onDragOver={onDragOverCard} onDrop={()=>onDropCard('persona', i)} onDragEnter={()=>setHoverIndex(i)} onDragLeave={()=>setHoverIndex(-1)}>
+              {/* Header */}
+              <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                  {p.thumbnail ? (
+                    <img src={p.thumbnail} alt={p.name} style={{ width:72, height:72, borderRadius:999, objectFit:"cover", border:"1px solid #e5e7eb" }} />
+                  ) : (
+                    <div style={{ width:72, height:72, borderRadius:999, display:"flex", alignItems:"center", justifyContent:"center", background:"#e5e7eb", color:'#374151', fontWeight:700 }}>{initials(p.name)}</div>
+                  )}
+                  <div style={{ fontWeight:700 }}>{p.name}</div>
+                </div>
+                <div style={{ display:"flex", gap:6 }}>
+                  <input type="file" accept="image/*" ref={el=> filePickers.current[i]=el} onChange={e=>onFileChange(i,e)} style={{ display:"none" }} />
+                  <button style={subtleBtn} onClick={()=>triggerFile(i)}>Upload</button>
+                  {p.thumbnail && <button style={subtleBtn} onClick={()=>{ const c=[...personas]; c[i].thumbnail=""; setPersonas(c); }}>Remove</button>}
+                </div>
+              </div>
+
+              {/* Core fields */}
+              <div style={{ display:"grid", gap:8 }}>
+                <div>
+                  <label style={smallText}>Birthday</label>
+                  <input type="date" style={inputStyle} value={p.birthday||""} onChange={e=>{ const c=[...personas]; c[i].birthday=e.target.value; setPersonas(c); }} />
+                </div>
+                <div>
+                  <label style={smallText}>Age</label>
+                  <input style={inputStyle} value={calcAge(p.birthday)||""} readOnly placeholder="Auto" />
+                </div>
+
+                {/* Handles */}
+                <div>
+                  <label style={smallText}>User Name</label>
+                  <div style={{ display:"flex", gap:8 }}>
+                    {(() => { const draft = handleDraft[p.id] || { username:"", platform: CHANNEL_CHOICES[0] }; return (
+                      <>
+                        <input style={{ ...inputStyle }} value={draft.username} onChange={e=> setHandleDraft({ ...handleDraft, [p.id]: { ...draft, username: e.target.value } })} placeholder="Enter user name" />
+                        <select value={draft.platform} onChange={e=> setHandleDraft({ ...handleDraft, [p.id]: { ...draft, platform: e.target.value } })} style={{ ...inputStyle, maxWidth:180 }}>
+                          {CHANNEL_CHOICES.map(c=> <option key={c} value={c}>{c}</option>)}
+                        </select>
+                        <button style={subtleBtn} onClick={()=>{ const d = handleDraft[p.id] || { username:"", platform: CHANNEL_CHOICES[0] }; if(!d.username.trim()) return; const c=[...personas]; const arr = Array.isArray(c[i].handles)? c[i].handles.slice(): []; arr.push({ platform: d.platform, username: d.username.trim() }); c[i].handles = arr; setPersonas(c); setHandleDraft({ ...handleDraft, [p.id]: { ...d, username: "" } }); }}>Add</button>
+                      </>
+                    ); })()}
+                  </div>
+                  {Array.isArray(p.handles) && p.handles.length>0 && (
+                    <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginTop:6 }}>
+                      {p.handles.map((h,hi)=>(
+                        <span key={h.platform+hi} style={chipStyle}>
+                          {h.platform}: <strong style={{ marginLeft:4 }}>{h.username}</strong>
+                          <button onClick={()=>{ const c=[...personas]; const arr=(c[i].handles||[]).slice(); arr.splice(hi,1); c[i].handles=arr; setPersonas(c); }} style={{ background:"none", border:"none", color:"#ef4444", marginLeft:6 }}>x</button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Bio with lock/unlock */}
+                <div>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                    <label style={smallText}>Bio</label>
+                    <button
+                      type="button"
+                      style={{ ...linkBtn, opacity: (p.bioSaved && p.bio?.trim()) ? 1 : 0.4, cursor: (p.bioSaved && p.bio?.trim()) ? "pointer" : "default" }}
+                      onClick={() => { if (p.bioSaved && p.bio?.trim()) setBioModalId(p.id); }}
+                      title={p.bioSaved ? "Open full bio" : "Lock the bio first"}
+                      disabled={!p.bioSaved || !p.bio?.trim()}
+                    >
+                      View full
+                    </button>
+                  </div>
+                  <textarea
+                    rows={6}
+                    disabled={!!p.bioSaved}
+                    style={{ ...inputStyle, maxHeight:160, overflowY:"auto", resize:"vertical", ...(p.bioSaved ? { background:"#f3f4f6", color:"#6b7280" } : {}) }}
+                    value={p.bio || ""}
+                    onChange={e=>{ const c=[...personas]; c[i].bio=e.target.value; setPersonas(c); }}
+                    placeholder="Background"
+                  />
+                  <div style={{ marginTop:6, display:"flex", alignItems:"center", gap:10 }}>
+                    <button
+                      type="button"
+                      style={primaryBtn}
+                      onClick={() => (p.bioSaved ? unlockBio(p.id) : lockBio(p.id))}
+                      disabled={!p.bio?.trim() && !p.bioSaved}
+                      title={!p.bio?.trim() && !p.bioSaved ? "Enter some text first" : ""}
+                    >
+                      {p.bioSaved ? "Modify" : "Add"}
+                    </button>
+                    {p.bioSavedAt ? <span style={smallText}>{p.bioSaved ? "Locked" : "Unlocked"} • {new Date(p.bioSavedAt).toLocaleString()}</span> : (p.bioSaved ? <span style={smallText}>Locked</span> : null)}
+                  </div>
+                </div>
+
+                {/* Physical fields */}
+                <div>
+                  <div>
+                    <label>Archetype</label>
+                    <input
+                      type="text"
+                      value={p.archetype || ""}
+                      onChange={e => updatePersona(p.id, { archetype: e.target.value })}
+                      placeholder="e.g. Girl-next-door, Femme Fatale, Sweetheart"
+                      style={inputStyle}
+                    />
+                  </div>
+
+                  <label>Ethnicity</label>
+                  <input type="text" value={p.ethnicity || ""} onChange={e => updatePersona(p.id, { ethnicity: e.target.value })} style={inputStyle} />
+                </div>
+                <div>
+                  <label>Height</label>
+                  <input type="text" placeholder="e.g. 5′7″" value={p.height || ""} onChange={e => updatePersona(p.id, { height: e.target.value })} style={inputStyle} />
+                </div>
+                <div>
+                  <label>Weight Range</label>
+                  <input type="text" placeholder="e.g. 120–135 lbs" value={p.weightRange || ""} onChange={e => updatePersona(p.id, { weightRange: e.target.value })} style={inputStyle} />
+                </div>
+                <div>
+                  <label>Measurements</label>
+                  <input type="text" placeholder="e.g. 34–26–36" value={p.measurements || ""} onChange={e => updatePersona(p.id, { measurements: e.target.value })} style={inputStyle} />
+                </div>
+                <div>
+                  <label>Cup Size</label>
+                  <input type="text" placeholder="e.g. C" value={p.cupSize || ""} onChange={e => updatePersona(p.id, { cupSize: e.target.value })} style={inputStyle} />
+                </div>
+
+                {/* Voice upload */}
+                <div>
+                  <label style={smallText}>Voice</label>
+                  <div style={{ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' }}>
+                    <input type="file" accept="audio/*" ref={el=> voicePickers.current[i]=el} onChange={e=>onVoiceChange(i,e)} style={{ display:'none' }} />
+                    {p.voice ? (
+                      <>
+                        <audio controls src={p.voice} style={{ flex:1, minWidth:220 }} />
+                        <button style={subtleBtn} onClick={()=>triggerVoice(i)}>Upload</button>
+                        <button style={subtleBtn} onClick={()=>{ const c=[...personas]; c[i].voice=""; setPersonas(c); }}>Remove</button>
+                      </>
+                    ) : (
+                      <>
+                        <button style={subtleBtn} onClick={()=>triggerVoice(i)}>Upload</button>
+                        <span style={smallText}>Add a short sample (mp3 / wav / m4a)</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {/* Chips upstream of Colors */}
+                <ChipField label="Affection Cues" items={p.affectionCues||[]} placeholder="e.g., nicknames, playful teasing" onChange={(arr)=>{ const c=[...personas]; c[i].affectionCues=arr; setPersonas(c); }} />
+                <ChipField label="Signature Phrases" items={p.signature||[]} placeholder="Catchphrases, sign-offs" onChange={(arr)=>{ const c=[...personas]; c[i].signature=arr; setPersonas(c); }} />
+                <ChipField label="Emojis" items={p.emojis||[]} placeholder="e.g., 😊, 🔥, ✨" onChange={(arr)=>{ const c=[...personas]; c[i].emojis=arr; setPersonas(c); }} />
+                <ChipField label="Interests" items={p.interests||[]} placeholder="Hobbies / topics" onChange={(arr)=>{ const c=[...personas]; c[i].interests=arr; setPersonas(c); }} />
+
+                {/* Colors between Interests && Favorites */}
+                <div style={{ border:"1px dashed #e5e7eb", borderRadius:10, padding:10, background:"#fff" }}>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                    <strong>Colors</strong>
+                    <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+                      <span style={{ width:16, height:16, borderRadius:99, border:"1px solid #e5e7eb", backgroundColor:p.primaryColor||"#fff" }} />
+                      <span style={{ width:16, height:16, borderRadius:99, border:"1px solid #e5e7eb", backgroundColor:p.secondaryColor||"#fff" }} />
+                    </div>
+                  </div>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginTop:8 }}>
+                    <div>
+                      <label style={smallText}>Primary</label>
+                      <div style={{ display:"grid", gridTemplateColumns:"44px 1fr", gap:8, alignItems:"center" }}>
+                        <input type="color" className="colorBox" value={p.primaryColor || "#111111"} onChange={e=> updatePersona(p.id, { primaryColor: e.target.value })} style={{ width:44, height:44, border:"1px solid #e5e7eb", borderRadius:8, padding:0, background:"#fff" }} />
+                        <input value={p.primaryColor || ""} onChange={e=>{ const v=e.target.value.trim(); const ok = v==="" || /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v); if(ok) updatePersona(p.id, { primaryColor: v }); }} placeholder="#111111" style={inputStyle} />
+                      </div>
+                    </div>
+                    <div>
+                      <label style={smallText}>Secondary</label>
+                      <div style={{ display:"grid", gridTemplateColumns:"44px 1fr", gap:8, alignItems:"center" }}>
+                        <input type="color" className="colorBox" value={p.secondaryColor || "#ff0055"} onChange={e=> updatePersona(p.id, { secondaryColor: e.target.value })} style={{ width:44, height:44, border:"1px solid #e5e7eb", borderRadius:8, padding:0, background:"#fff" }} />
+                        <input value={p.secondaryColor || ""} onChange={e=>{ const v=e.target.value.trim(); const ok = v==="" || /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(v); if(ok) updatePersona(p.id, { secondaryColor: v }); }} placeholder="#ff0055" style={inputStyle} />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Favorites split into 8 subfields */}
+                <div style={{ border:"1px solid #e5e7eb", borderRadius:10, padding:10, background:"#fff" }}>
+                  <strong>Favorites</strong>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginTop:8 }}>
+                    <ChipField label="Food" items={p.favorites?.food||[]} placeholder="e.g., sushi, tacos" onChange={(arr)=>{ const c=[...personas]; c[i].favorites = { ...(c[i].favorites||{}), food: arr }; setPersonas(c); }} />
+                    <ChipField label="Movies" items={p.favorites?.movies||[]} placeholder="e.g., sci‑fi, rom‑com" onChange={(arr)=>{ const c=[...personas]; c[i].favorites = { ...(c[i].favorites||{}), movies: arr }; setPersonas(c); }} />
+                    <ChipField label="TV Shows" items={p.favorites?.tvShows||[]} placeholder="e.g., sitcoms, dramas" onChange={(arr)=>{ const c=[...personas]; c[i].favorites = { ...(c[i].favorites||{}), tvShows: arr }; setPersonas(c); }} />
+                    <ChipField label="Music" items={p.favorites?.music||[]} placeholder="e.g., pop, EDM" onChange={(arr)=>{ const c=[...personas]; c[i].favorites = { ...(c[i].favorites||{}), music: arr }; setPersonas(c); }} />
+                    <ChipField label="Books" items={p.favorites?.books||[]} placeholder="e.g., thrillers, fantasy" onChange={(arr)=>{ const c=[...personas]; c[i].favorites = { ...(c[i].favorites||{}), books: arr }; setPersonas(c); }} />
+                    <ChipField label="Types of Vacations" items={p.favorites?.vacations||[]} placeholder="e.g., beach, city breaks" onChange={(arr)=>{ const c=[...personas]; c[i].favorites = { ...(c[i].favorites||{}), vacations: arr }; setPersonas(c); }} />
+                    <ChipField label="Games" items={p.favorites?.games||[]} placeholder="e.g., RPGs, co‑op" onChange={(arr)=>{ const c=[...personas]; c[i].favorites = { ...(c[i].favorites||{}), games: arr }; setPersonas(c); }} />
+                    <ChipField label="Sports" items={p.favorites?.sports||[]} placeholder="e.g., soccer, F1" onChange={(arr)=>{ const c=[...personas]; c[i].favorites = { ...(c[i].favorites||{}), sports: arr }; setPersonas(c); }} />
+                  </div>
+                </div>
+
+                {/* Rest of chip sections */}
+                <ChipField label="Style" items={p.style||[]} placeholder="Wardrobe / vibe" onChange={(arr)=>{ const c=[...personas]; c[i].style=arr; setPersonas(c); }} />
+                <ChipField label="Values" items={p.values||[]} placeholder="Core principles" onChange={(arr)=>{ const c=[...personas]; c[i].values=arr; setPersonas(c); }} />
+                <ChipField label="Do's & Don'ts" items={p.dosDonts||[]} placeholder="Guidelines / avoidances" onChange={(arr)=>{ const c=[...personas]; c[i].dosDonts=arr; setPersonas(c); }} />
+                <ChipField label="Goals" items={p.goals||[]} placeholder="Short/long-term" onChange={(arr)=>{ const c=[...personas]; c[i].goals=arr; setPersonas(c); }} />
+                <ChipField label="Fears" items={p.fears||[]} placeholder="What they avoid" onChange={(arr)=>{ const c=[...personas]; c[i].fears=arr; setPersonas(c); }} />
+                <ChipField label="Boundaries" items={p.boundaries||[]} placeholder="Hard no's" onChange={(arr)=>{ const c=[...personas]; c[i].boundaries=arr; setPersonas(c); }} />
+                <ChipField label="Tone" items={p.tone||[]} placeholder="e.g., warm & friendly" onChange={(arr)=>{ const c=[...personas]; c[i].tone=arr; setPersonas(c); }} />
+                {/* Affiliate Marketing (Bio-like) BELOW Tone */}
+                <div>
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                    <label style={smallText}>Affiliate Marketing</label>
+                    {p.affiliateMarketing?.savedAt ? (
+                      <span style={smallText}>
+                        {p.affiliateMarketing?.locked ? "Locked" : "Unlocked"} • {new Date(p.affiliateMarketing.savedAt).toLocaleString()}
+                      </span>
+                    ) : null}
+                  </div>
+                  <textarea
+                    rows={4}
+                    disabled={!!p.affiliateMarketing?.locked}
+                    style={{ ...inputStyle, maxHeight:140, overflowY:"auto", resize:"vertical", ...(p.affiliateMarketing?.locked ? { background:"#f3f4f6", color:"#6b7280" } : {}) }}
+                    value={(p.affiliateMarketing?.text)||""}
+                    onChange={e=>{ const c=[...personas]; c[i].affiliateMarketing = { ...(c[i].affiliateMarketing||{text:"",locked:false,savedAt:0}), text: e.target.value }; setPersonas(c); }}
+                    placeholder="Program links, offers, talking points"
+                  />
+                  <div style={{ marginTop:6, display:"flex", alignItems:"center", gap:10 }}>
+                    <button
+                      type="button"
+                      style={primaryBtn}
+                      onClick={() => (p.affiliateMarketing?.locked ? unlockAffiliate(p.id) : lockAffiliate(p.id))}
+                      disabled={!((p.affiliateMarketing?.text||"").trim()) && !(p.affiliateMarketing?.locked)}
+                      title={!((p.affiliateMarketing?.text||"").trim()) && !(p.affiliateMarketing?.locked) ? "Enter some text first" : ""}
+                    >
+                      {p.affiliateMarketing?.locked ? "Modify" : "Add"}
+                    </button>
+                  </div>
+                </div>
+
+              </div>
+            </div>
+          ))}
+        </div>
+      </TabBoundary>)}
+
+      {/* ------------ HISTORY (placeholder copy retained) ------------- */}
+      {tab==="history" && (
+  <ErrorBoundary>
+    <div style={{ padding: 16 }}>
+      <input
+        type="text"
+        placeholder="Search history…"
+        value={historySearch}
+        onChange={(e)=>setHistorySearch(e.target.value)}
+        style={{ marginBottom: 12, padding: 8, width: "100%", maxWidth: 420, border: "1px solid #e5e7eb", borderRadius: 8 }}
+      />
+      {history.length === 0 ? (
+        <div style={{ color:"#6b7280" }}>No history yet. Actions will appear here once logged.</div>
+      ) : (
+        <table style={{ width:"100%", borderCollapse:"collapse", fontSize:14 }}>
+          <thead>
+            <tr style={{ background:"#f3f4f6" }}>
+              <th style={{ textAlign:"left", padding:8, borderBottom:"1px solid #e5e7eb" }}>Timestamp</th>
+              <th style={{ textAlign:"left", padding:8, borderBottom:"1px solid #e5e7eb" }}>Type</th>
+              <th style={{ textAlign:"left", padding:8, borderBottom:"1px solid #e5e7eb" }}>Persona</th>
+              <th style={{ textAlign:"left", padding:8, borderBottom:"1px solid #e5e7eb" }}>Channel</th>
+              <th style={{ textAlign:"left", padding:8, borderBottom:"1px solid #e5e7eb" }}>User</th>
+              <th style={{ textAlign:"left", padding:8, borderBottom:"1px solid #e5e7eb" }}>Message</th>
+              <th style={{ textAlign:"left", padding:8, borderBottom:"1px solid #e5e7eb" }}>Screenshot</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(history || [])
+              .filter(h => {
+                const q = (historySearch||"").toLowerCase();
+                return !q || [
+                  h.timestamp, h.type, h.persona, h.channel, h.user, h.message
+                ].some(v => String(v||"").toLowerCase().includes(q));
+              })
+              .map(h => (
+                <tr key={h.id} style={{ background: (h.id % 2) ? "#fff" : "#fafafa" }}>
+                  <td style={{ padding:8, borderBottom:"1px solid #f1f5f9" }}>{h.timestamp}</td>
+                  <td style={{ padding:8, borderBottom:"1px solid #f1f5f9" }}>{h.type}</td>
+                  <td style={{ padding:8, borderBottom:"1px solid #f1f5f9" }}>{h.persona}</td>
+                  <td style={{ padding:8, borderBottom:"1px solid #f1f5f9" }}>{h.channel}</td>
+                  <td style={{ padding:8, borderBottom:"1px solid #f1f5f9" }}>{h.user}</td>
+                  <td style={{ padding:8, borderBottom:"1px solid #f1f5f9", whiteSpace:"pre-wrap" }}>{h.message}</td>
+                  <td style={{ padding:8, borderBottom:"1px solid #f1f5f9" }}>
+                    {h.screenshot ? <a href={h.screenshot} target="_blank" rel="noopener noreferrer">View</a> : "—"}
+                  </td>
+                </tr>
+              ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  </ErrorBoundary>
+)}
+
+      {/* ------------ TEAM (simplified, keeps assignment) ------------- */}
+      {tab==="team" && (
+        <div style={{ display:"grid", gap:12 }}>
+          {team.map((m,mi)=>(
+            <div key={m.id} style={cardStyle}>
+              <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:8 }}>
+                <span style={{ width:12, height:12, borderRadius:99, background:(m.name===ownerName || (m.lastSeen && (Date.now()-m.lastSeen)<60000))?"#10b981":"#9ca3af" }} />
+                <strong>{m.name}</strong> — role: {m.role==='handler' ? 'QA' : m.role} — {(m.name===ownerName|| (m.lastSeen && (Date.now()-m.lastSeen)<60000))?"online":"away"}
+              </div>
+              <div style={{ display:"flex", gap:6, flexWrap:"wrap", marginBottom:8 }}>
+                {(m.personas||[]).map((pn,pi)=>(
+                  <span key={pn+pi} style={chipStyle}>{pn}
+                    <button onClick={()=>{ const c=[...team]; const list=(c[mi].personas||[]).slice(); list.splice(pi,1); c[mi] = { ...c[mi], personas:list }; setTeam(c); }} style={{ background:"none", border:"none", color:"#ef4444" }}>x</button>
+                  </span>
+                ))}
+              </div>
+              <select value="" onChange={e=>{ const val=e.target.value; if(!val) return; const c=[...team]; const setP=new Set((c[mi].personas||[])); setP.add(val); c[mi] = { ...c[mi], personas:[...setP] }; setTeam(c); }} style={{ ...inputStyle, width:260 }}>
+                <option value="">Assign persona…</option>
+                {personaNames.filter(n=> !assignedGlobal.has(n)).map(n=> <option key={n} value={n}>{n}</option>)}
+              </select>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <>
+        {/* ------------ USERS & FOLLOWING (placeholders) ------------- */}
+        {tab==="users" && (<div style={cardStyle}>Users tab</div>)}
+        {tab==="following" && (<div style={cardStyle}>Following tab</div>)}
+      </>
+      {tab==="admin" && (
+        <div style={cardStyle}>
+          <button style={subtleBtn} onClick={()=>{ localStorage.clear(); window.location.reload(); }}>Clear local storage</button>
+        </div>
+      )}
+
+      {/* ------------ BIO MODAL ------------- */}
+      {bioModalId && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:1100 }} onClick={() => setBioModalId("")}>
+          <div style={{ background:"#fff", borderRadius:12, padding:16, width:720, maxHeight:"80vh", overflow:"auto", border:"1px solid #e5e7eb" }} onClick={(e) => e.stopPropagation()}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+              <h3 style={{ margin:0 }}>Full Bio</h3>
+              <button style={subtleBtn} onClick={() => setBioModalId("")}>Close</button>
+            </div>
+            {(() => {
+              const persona = personas.find(pp => pp.id === bioModalId);
+              if (!persona) return <div style={smallText}>Persona ! found.</div>;
+              return (
+                <div style={{ whiteSpace:"pre-wrap", lineHeight:1.5 }}>
+                  {persona.bio || <span style={smallText}>No bio added yet.</span>}
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
+      {/* ---------- Full-bleed color input swatch styling ---------- */}
+      <style>{`
+        .colorBox{
+          -webkit-appearance: none;
+          appearance: none;
+          border: none;
+          padding: 0;
+          width: 44px;
+          height: 44px;
+          border-radius: 10px;
+          cursor: pointer;
+          background: transparent;
+        }
+        .colorBox::-webkit-color-swatch-wrapper { padding:0; border-radius:10px; }
+        .colorBox::-webkit-color-swatch { border:none; border-radius:10px; }
+        .colorBox::-moz-color-swatch { border:none; border-radius:10px; }
+      `}</style>
+    </div>
+  );
+}
